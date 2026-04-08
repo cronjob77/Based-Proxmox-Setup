@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+output(){
+    printf '\e[1;34m%-6s\e[m\n' "${@}"
+}
+
+# Compliance
+systemctl mask debug-shell.service
+
+## Avoid phased updates
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/apt/apt.conf.d/99sane-upgrades | tee /etc/apt/apt.conf.d/99sane-upgrades > /dev/null
+
+# Setup NTS
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/refs/heads/main/etc/chrony/conf.d/10-custom.conf | tee /etc/chrony/conf.d/10-custom.conf > /dev/null
+systemctl restart chronyd
+
+# Harden SSH
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/ssh/sshd_config.d/10-custom.conf | tee /etc/ssh/sshd_config.d/10-custom.conf > /dev/null
+sed -i 's/PermitRootLogin no/PermitRootLogin yes/g' /etc/ssh/sshd_config.d/10-custom.conf
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/ssh/ssh_config.d/10-custom.conf | tee /etc/ssh/ssh_config.d/10-custom.conf > /dev/null
+mkdir -p /etc/systemd/system/sshd.service.d/
+chmod 755 /etc/systemd/system/sshd.service.d/
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/systemd/system/sshd.service.d/override.conf | tee /etc/systemd/system/sshd.service.d/override.conf > /dev/null
+systemctl daemon-reload
+systemctl restart sshd
+
+# Setup repositories
+echo "Enabled: no" >>/etc/apt/sources.list.d/pve-enterprise.sources
+echo "Enabled: no" >>/etc/apt/sources.list.d/ceph.sources
+
+echo "Types: deb
+URIs: https://deb.debian.org/debian/
+Suites: trixie trixie-updates trixie-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: https://security.debian.org/debian-security/
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" | tee /etc/apt/sources.list.d/debian.sources
+
+echo "Types: deb
+URIs: http://download.proxmox.com/debian/pve
+Suites: trixie
+Components: pve-no-subscription
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg" | tee /etc/apt/sources.list.d/proxmox.sources
+
+# Update packages
+apt update
+apt full-upgrade -y
+apt autoremove -y
+
+CPU=$(grep vendor_id /proc/cpuinfo)
+if [ "${CPU}" = "*AuthenticAMD*" ]; then
+    microcode=amd64-microcode
+else
+    microcode=intel-microcode
+fi
+
+# Install packages
+apt install -y "${microcode}" unattended-upgrades systemd-zram-generator tuned
+
+### This part assumes that you are using systemd-boot
+echo "mitigations=auto,nosmt nosmt=force spectre_v2=on spectre_bhi=on spec_store_bypass_disable=on tsx=off l1d_flush=on l1tf=full,force kvm-intel.vmentry_l1d_flush=always spec_rstack_overflow=safe-ret gather_data_sampling=force reg_file_data_sampling=on kvm.nx_huge_pages=force amd_iommu=force_isolation intel_iommu=on iommu=force iommu.strict=1 iommu.passthrough=0 efi=disable_early_pci_dma slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 pti=on randomize_kstack_offset=on lockdown=confidentiality module.sig_enforce=1 oops=panic vsyscall=none ia32_emulation=0 debugfs=off random.trust_bootloader=off random.trust_cpu=off nomodeset $(cat /etc/kernel/cmdline)" > /etc/kernel/cmdline
+proxmox-boot-tool refresh
+###
+
+# Kernel hardening
+curl -s https://raw.githubusercontent.com/secureblue/secureblue/live/files/system/usr/lib/modprobe.d/secureblue-framebuffer.conf | tee /etc/modprobe.d/framebuffer-blacklist.conf > /dev/null
+curl -s https://raw.githubusercontent.com/secureblue/secureblue/live/files/system/usr/lib/modprobe.d/secureblue.conf | tee /etc/modprobe.d/server-blacklist.conf > /dev/null
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/sysctl.d/99-server.conf | tee /etc/sysctl.d/99-server.conf > /dev/null
+sysctl -p /etc/sysctl.d
+
+# Rebuild initramfs
+update-initramfs -u
+
+# Disable coredump
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/security/limits.d/30-disable-coredump.conf | tee /etc/security/limits.d/30-disable-coredump.conf > /dev/null
+mkdir -p /etc/systemd/coredump.conf.d
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/systemd/coredump.conf.d/disable.conf | tee /etc/systemd/coredump.conf.d/disable.conf > /dev/null
+
+# Setup ZRAM
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/main/etc/systemd/zram-generator.conf | tee /etc/systemd/zram-generator.conf > /dev/null
+
+# Disable Nagging
+sed -Ezi.bak "s/(Ext.Msg.show\(\{\s+title: gettext\('No valid sub)/void\(\{ \/\/\1/g" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+
+systemctl restart pveproxy.service
+
+# Configure automatic updates
+curl -s https://raw.githubusercontent.com/Metropolis-nexus/Common-Files/refs/heads/main/etc/apt/apt.conf.d/52unattended-upgrades-local | tee /etc/apt/apt.conf.d/52unattended-upgrades-local > /dev/null
+
+# Setup tuned
+tuned-adm profile virtual-host
+
+# Enable fstrim.timer
+systemctl enable --now fstrim.timer
